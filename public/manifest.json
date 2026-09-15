@@ -1,0 +1,9 @@
+{
+  "short_name": "CI/CD Demo",
+  "name": "CI/CD Demo Application",
+  "icons": [],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
+}
