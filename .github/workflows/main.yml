@@ -1,15 +1,62 @@
-name: Frontend CI
+# =============================================================================
+# Frontend CI/CD
+#
+# Pipeline shape:
+#   1. Unit Test    - runs on a GitHub-hosted runner
+#   2. Build & Push - builds the Docker image and stores it as a GHCR
+#                      package tagged with a unique ID derived from the
+#                      commit SHA (e.g. ghcr.io/OWNER/REPO:sha-1a2b3c4)
+#   3. Deploy       - runs on a SELF-HOSTED runner installed on the EC2
+#                      deployment server itself (the "agent"). It pulls the
+#                      exact image built in step 2 from GHCR and runs it as
+#                      a container, right there on the box - no SSH needed.
+#
+# --- One-time setup on the EC2 deployment server -------------------------
+# Install a self-hosted GitHub Actions runner on the instance:
+#   Repo (or Org) Settings > Actions > Runners > New self-hosted runner
+#   Follow GitHub's generated download/config/svc commands for Linux, e.g.:
+#     ./config.sh --url <repo-or-org-url> --token <token-from-ui> --labels production
+#     sudo ./svc.sh install && sudo ./svc.sh start
+#   Docker must be installed on the instance, and the runner's user must be
+#   able to run docker commands (usually: add the user to the docker group).
+#   If you want ONE agent shared by all four repos (frontend + 3 services),
+#   register the runner at the ORGANIZATION level with a runner group that
+#   includes all four repos, rather than registering it per-repo.
+#
+# Required GitHub Variables (Settings > Secrets and variables > Actions > Variables)
+#   CONTAINER_NAME - name to run the container as on the host, e.g. demo-frontend
+#   HOST_PORT      - port exposed on the host, e.g. 8080
+#   CONTAINER_PORT - port the container listens on (80 for the Apache image)
+#
+# No deployment secrets (SSH keys, host IPs) are needed at all - the runner
+# already lives on the target machine. GITHUB_TOKEN (provided automatically)
+# is all that's needed to pull the private image from GHCR.
+# =============================================================================
+
+name: Frontend CI/CD
 
 on:
   push:
     branches: learn
   pull_request:
     branches: learn
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  build-test-and-dockerize:
+  # ---------------------------------------------------------------------
+  # 1. Unit Test
+  # ---------------------------------------------------------------------
+  test:
+    name: Unit Test
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -23,19 +70,127 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
-        run: npm test -- --watchAll=false
+      # api.test.ts and ServicePanel.test.tsx are the unit tests;
+      # App.test.tsx is the integrated component test.
+      - name: Run unit tests with coverage
+        run: npm test -- --watchAll=false --coverage
         env:
           CI: true
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: coverage/
+          retention-days: 7
 
       - name: Build production bundle
         run: npm run build
 
-      - name: Docker build
-        run: docker build -t demo-frontend:${{ github.sha }} .
+  # ---------------------------------------------------------------------
+  # 2. Build & Push - image becomes a GHCR artifact tagged by commit SHA
+  # ---------------------------------------------------------------------
+  build-and-push:
+    name: Build & Push Image
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      # The single, immutable, commit-derived tag pushed below - this is
+      # what the deploy agent pulls, never a floating "latest" tag.
+      image_tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      # Deployment step (placeholder).
-      # Fill this in yourself with your target: push to a registry,
-      # deploy to a server, redeploy a container, etc.
-      - name: Deploy
-        run: echo "Add your deployment step here"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,format=short,priority=1000
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image artifact
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------
+  # 3. Deploy - runs ON the deployment server via the self-hosted agent
+  # ---------------------------------------------------------------------
+  deploy:
+    name: Deploy (self-hosted agent)
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, production]
+    timeout-minutes: 10
+    environment: production
+    permissions:
+      packages: read
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}:${{ needs.build-and-push.outputs.image_tag }}
+      CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+      HOST_PORT: ${{ vars.HOST_PORT }}
+      CONTAINER_PORT: ${{ vars.CONTAINER_PORT }}
+    steps:
+      - name: Pull image artifact and run as a container
+        run: |
+          set -euo pipefail
+
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+
+          # Remember what's currently running so we can roll back on failure
+          PREVIOUS_IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+
+          docker stop "$CONTAINER_NAME" 2>/dev/null || true
+          docker rm "$CONTAINER_NAME" 2>/dev/null || true
+
+          docker run -d \
+            --name "$CONTAINER_NAME" \
+            --restart unless-stopped \
+            -p "$HOST_PORT:$CONTAINER_PORT" \
+            "$IMAGE"
+
+          echo "Waiting for the new container to become healthy..."
+          for i in $(seq 1 10); do
+            if curl -sf "http://localhost:$HOST_PORT" > /dev/null; then
+              echo "Deployment healthy."
+              exit 0
+            fi
+            sleep 3
+          done
+
+          echo "Health check failed - rolling back."
+          docker stop "$CONTAINER_NAME" 2>/dev/null || true
+          docker rm "$CONTAINER_NAME" 2>/dev/null || true
+          if [ -n "$PREVIOUS_IMAGE" ]; then
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              -p "$HOST_PORT:$CONTAINER_PORT" \
+              "$PREVIOUS_IMAGE"
+          fi
+          exit 1
