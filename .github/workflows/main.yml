@@ -1,0 +1,41 @@
+name: Frontend CI
+
+on:
+  push:
+    branches: learn
+  pull_request:
+    branches: learn
+
+jobs:
+  build-test-and-dockerize:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --watchAll=false
+        env:
+          CI: true
+
+      - name: Build production bundle
+        run: npm run build
+
+      - name: Docker build
+        run: docker build -t demo-frontend:${{ github.sha }} .
+
+      # Deployment step (placeholder).
+      # Fill this in yourself with your target: push to a registry,
+      # deploy to a server, redeploy a container, etc.
+      - name: Deploy
+        run: echo "Add your deployment step here"
