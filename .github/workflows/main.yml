@@ -2,9 +2,9 @@ name: Frontend CI/CD
 
 on:
   push:
-    branches: [main]
+    branches: learn
   pull_request:
-    branches: [main]
+    branches: learn
   workflow_dispatch:
 
 concurrency:
