@@ -1,3 +1,4 @@
+```yaml
 name: Frontend CI/CD
 
 on:
@@ -52,41 +53,12 @@ jobs:
 
 
   # ============================================================
-  # Stage 2: Code Quality
-  # ============================================================
-  code-quality:
-    name: "Stage 2: Code Quality"
-    needs: unit-test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run SonarQube analysis
-        uses: SonarSource/sonarqube-scan-action@v7
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-
-
-  # ============================================================
-  # Stage 3: Build & Artifact
+  # Stage 2: Build & Artifact
   # ============================================================
   build:
-    name: "Stage 3: Build & Artifact"
-    needs: code-quality
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: "Stage 2: Build & Artifact"
+    needs: unit-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/learn'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -106,6 +78,7 @@ jobs:
         id: vars
         run: |
           COMMIT_ID="${GITHUB_SHA:0:7}"
+
           echo "commit_id=$COMMIT_ID" >> "$GITHUB_OUTPUT"
           echo "artifact_name=demo-frontend-$COMMIT_ID" >> "$GITHUB_OUTPUT"
 
@@ -142,14 +115,14 @@ jobs:
 
 
   # ============================================================
-  # Stage 4: Deploy
+  # Stage 3: Deploy
   # ============================================================
   deploy:
-    name: "Stage 4: Deploy"
+    name: "Stage 3: Deploy"
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, production]
-    timeout-minutes: 10
+    if: github.event_name == 'push' && github.ref == 'refs/heads/learn'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     environment: production
 
@@ -163,60 +136,145 @@ jobs:
       CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
       HOST_PORT: ${{ vars.HOST_PORT }}
       CONTAINER_PORT: ${{ vars.CONTAINER_PORT }}
+      SERVER_HOST: ${{ secrets.SERVER_HOST }}
+      SERVER_USER: ${{ secrets.SERVER_USER }}
 
     steps:
+
+      # ----------------------------------------------------------
+      # Download Docker image artifact
+      # ----------------------------------------------------------
       - name: Download Docker image artifact
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: .
 
-      - name: Load Docker image
+      # ----------------------------------------------------------
+      # Configure SSH
+      # ----------------------------------------------------------
+      - name: Configure SSH
         run: |
-          docker load -i "${ARTIFACT_NAME}.tar"
+          mkdir -p ~/.ssh
 
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+
+          chmod 600 ~/.ssh/deploy_key
+
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+
+      # ----------------------------------------------------------
+      # Copy Docker image to server
+      # ----------------------------------------------------------
+      - name: Copy Docker image to server
+        run: |
+          scp \
+            -i ~/.ssh/deploy_key \
+            "${ARTIFACT_NAME}.tar" \
+            "${SERVER_USER}@${SERVER_HOST}:/tmp/${ARTIFACT_NAME}.tar"
+
+      # ----------------------------------------------------------
+      # Deploy container
+      # ----------------------------------------------------------
       - name: Deploy container
         run: |
+          ssh \
+            -i ~/.ssh/deploy_key \
+            "${SERVER_USER}@${SERVER_HOST}" \
+            bash -s << EOF
+
           set -euo pipefail
 
-          PREVIOUS_IMAGE=$(docker inspect \
-            --format='{{.Config.Image}}' \
-            "$CONTAINER_NAME" 2>/dev/null || echo "")
+          IMAGE_NAME="${IMAGE_NAME}"
+          COMMIT_ID="${COMMIT_ID}"
+          CONTAINER_NAME="${CONTAINER_NAME}"
+          HOST_PORT="${HOST_PORT}"
+          CONTAINER_PORT="${CONTAINER_PORT}"
+          ARTIFACT_NAME="${ARTIFACT_NAME}"
 
-          docker stop "$CONTAINER_NAME" 2>/dev/null || true
-          docker rm "$CONTAINER_NAME" 2>/dev/null || true
+          echo "Loading Docker image..."
+
+          docker load -i "/tmp/\${ARTIFACT_NAME}.tar"
+
+          echo "Checking previous container..."
+
+          PREVIOUS_IMAGE=\$(docker inspect \
+            --format='{{.Config.Image}}' \
+            "\$CONTAINER_NAME" 2>/dev/null || echo "")
+
+          echo "Previous image: \$PREVIOUS_IMAGE"
+
+          echo "Stopping existing container..."
+
+          docker stop "\$CONTAINER_NAME" 2>/dev/null || true
+          docker rm "\$CONTAINER_NAME" 2>/dev/null || true
+
+          echo "Starting new container..."
 
           docker run -d \
-            --name "$CONTAINER_NAME" \
+            --name "\$CONTAINER_NAME" \
             --restart unless-stopped \
-            -p "$HOST_PORT:$CONTAINER_PORT" \
-            "$IMAGE_NAME:$COMMIT_ID"
+            -p "\$HOST_PORT:\$CONTAINER_PORT" \
+            "\$IMAGE_NAME:\$COMMIT_ID"
 
-          for i in $(seq 1 10); do
-            if curl -sf "http://localhost:$HOST_PORT" > /dev/null; then
+          echo "Waiting for application..."
+
+          for i in \$(seq 1 10); do
+
+            if curl -sf "http://localhost:\$HOST_PORT" > /dev/null; then
               echo "Deployment successful."
               exit 0
             fi
 
+            echo "Health check attempt \$i failed."
             sleep 3
+
           done
 
-          echo "Health check failed. Rolling back."
+          echo "Health check failed."
+          echo "Starting rollback..."
 
-          docker stop "$CONTAINER_NAME" 2>/dev/null || true
-          docker rm "$CONTAINER_NAME" 2>/dev/null || true
+          docker stop "\$CONTAINER_NAME" 2>/dev/null || true
+          docker rm "\$CONTAINER_NAME" 2>/dev/null || true
 
-          if [ -n "$PREVIOUS_IMAGE" ]; then
+          if [ -n "\$PREVIOUS_IMAGE" ]; then
+
+            echo "Rolling back to \$PREVIOUS_IMAGE"
+
             docker run -d \
-              --name "$CONTAINER_NAME" \
+              --name "\$CONTAINER_NAME" \
               --restart unless-stopped \
-              -p "$HOST_PORT:$CONTAINER_PORT" \
-              "$PREVIOUS_IMAGE"
+              -p "\$HOST_PORT:\$CONTAINER_PORT" \
+              "\$PREVIOUS_IMAGE"
+
+            echo "Rollback completed."
+
+          else
+
+            echo "No previous image available for rollback."
+
           fi
 
           exit 1
 
-      - name: Clean up old images
+          EOF
+
+      # ----------------------------------------------------------
+      # Remove artifact from server
+      # ----------------------------------------------------------
+      - name: Remove artifact from server
         if: always()
         run: |
-          docker image prune -f --filter "until=72h" || true
+          ssh \
+            -i ~/.ssh/deploy_key \
+            "${SERVER_USER}@${SERVER_HOST}" \
+            "rm -f /tmp/${ARTIFACT_NAME}.tar"
+
+      # ----------------------------------------------------------
+      # Clean SSH key
+      # ----------------------------------------------------------
+      - name: Cleanup SSH key
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key
+```
